@@ -49,6 +49,7 @@ enum struct HttpStatus : long {
     ProxyAuthRequired = 407,
     RequestTimeout = 408,
     Gone = 410,
+    RangeNotSatisfiable = 416,
     TooManyRequests = 429,
     NotImplemented = 501,
     ServiceUnavailable = 503,
@@ -232,6 +233,9 @@ struct curlFileTransfer : public FileTransfer
         std::optional<uint32_t> retryAfterMs;
 
         curl_off_t writtenToSink = 0;
+        curl_off_t resumeOffset = 0;
+        std::string streamedETag;
+        std::optional<curl_off_t> unsatisfiedRangeSize;
 
         std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
 
@@ -281,6 +285,8 @@ struct curlFileTransfer : public FileTransfer
                     /* Only write data to the sink if this is a
                        successful response. */
                     if (successfulStatuses.count(httpStatus)) {
+                        if (writtenToSink == 0)
+                            streamedETag = result.etag;
                         writtenToSink += data.size();
                         PauseTransfer needsPause = this->request.dataCallback(data);
                         if (needsPause == PauseTransfer::Yes) {
@@ -413,6 +419,7 @@ struct curlFileTransfer : public FileTransfer
                 acceptRanges = false;
                 hasContentEncoding = false;
                 retryAfterMs = std::nullopt;
+                unsatisfiedRangeSize = std::nullopt;
                 appendCurrentUrl();
             } else {
 
@@ -431,6 +438,12 @@ struct curlFileTransfer : public FileTransfer
 
                     else if (name == "accept-ranges" && toLower(trim(line.substr(i + 1))) == "bytes")
                         acceptRanges = true;
+
+                    else if (name == "content-range") {
+                        auto value = trim(line.substr(i + 1));
+                        if (value.starts_with("bytes */"))
+                            unsatisfiedRangeSize = string2Int<curl_off_t>(value.substr(8));
+                    }
 
                     else if (name == "link" || name == "x-amz-meta-link") {
                         auto value = trim(line.substr(i + 1));
@@ -705,8 +718,9 @@ struct curlFileTransfer : public FileTransfer
             curl_easy_setopt(req, CURLOPT_NETRC_FILE, fileTransfer.settings.netrcFile.get().string().c_str());
             curl_easy_setopt(req, CURLOPT_NETRC, CURL_NETRC_OPTIONAL);
 
-            if (writtenToSink)
-                curl_easy_setopt(req, CURLOPT_RESUME_FROM_LARGE, writtenToSink);
+            resumeOffset = writtenToSink;
+            if (resumeOffset)
+                curl_easy_setopt(req, CURLOPT_RESUME_FROM_LARGE, resumeOffset);
 
             /* Note that the underlying strings get copied by libcurl, so the path -> string conversion is ok:
                > The application does not have to keep the string around after setting this option.
@@ -871,7 +885,13 @@ struct curlFileTransfer : public FileTransfer
             if (callbackException)
                 failEx(callbackException);
 
-            else if (code == CURLE_OK && successfulStatuses.count(httpStatus)) {
+            else if (
+                code == CURLE_OK
+                && (successfulStatuses.count(httpStatus)
+                    || (httpStatus == HttpStatus::RangeNotSatisfiable && request.method == HttpMethod::Get
+                        && resumeOffset > 0 && unsatisfiedRangeSize == resumeOffset && writtenToSink == resumeOffset
+                        && !hasContentEncoding
+                        && (streamedETag.empty() || result.etag.empty() || streamedETag == result.etag)))) {
                 result.cached = (httpStatus == HttpStatus::NotModified);
                 curl_off_t dlSize = 0;
                 curl_easy_getinfo(req, CURLINFO_SIZE_DOWNLOAD_T, &dlSize);

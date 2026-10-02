@@ -8,6 +8,7 @@
 
 let
   testScript = ./test_retry_backoff.py;
+  resumeTestScript = ./test_resume_at_eof.py;
 
   nixConf = writeText "nix.conf" ''
     experimental-features = nix-command
@@ -35,5 +36,6 @@ runCommand "filetransfer-retry-backoff"
     cp ${nixConf} "$NIX_CONF_DIR/nix.conf"
 
     python3 ${testScript}
+    python3 ${resumeTestScript}
     mkdir -p $out
   ''
